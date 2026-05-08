@@ -55,7 +55,7 @@ DEFAULT_CONFIG = {
     "monitored_extensions": [".doc", ".docx", ".xls", ".xlsx", ".pdf", ".jpg", ".jpeg", ".png", ".txt", ".sql", ".csv"],
     "excluded_dirs": ["/proc", "/sys", "/dev", "C:\\Windows", "C:\\Program Files", "/System", "/Library"],
     "honeypot_names": ["secret_business_plan.docx", "password_backup.txt", "bank_accounts.xlsx", "important_database.sql"],
-    "max_file_size_mb": 100,        # Skip files larger than this for entropy scanning
+    "max_file_size_mb": 500,        # Skip files larger than this for entropy scanning
     "quarantine_dir": "./quarantine"
 }
 
@@ -350,7 +350,7 @@ class RansomwareDetector:
         banner = f"""
 ╔══════════════════════════════════════════════════════════════════╗
 ║     Ransomware Detection Tool - Behavioral Analysis System       ║
-║                    Signature: {{OrezZIY o'T}}                    ║
+║                     {{OrezZIY o'T}}                              ║
 ║                  Professional Security Tool v1.0                 ║
 ╚══════════════════════════════════════════════════════════════════╝
         """
@@ -501,7 +501,7 @@ class RansomwareDetector:
 def main():
     parser = argparse.ArgumentParser(
         description="Ransomware Detection Tool - Professional Behavioral Analysis",
-        epilog="Signature: {orezziy} - GitHub: https://github.com/orezziy/ransomware-detector"
+        epilog="Author: {oreoluwa} - GitHub: https://github.com/MrOreziy/RANSOMWARE-DETECTION-TOOL/tree/main"
     )
     
     parser.add_argument("--monitor", "-m", type=str, help="Directory to monitor in real-time")
