@@ -1,0 +1,565 @@
+#!/usr/bin/env python3
+"""
+Ransomware Detection Tool - Professional Behavioral Analysis System
+Author: {orezziy}
+GitHub: https://github.com/MrOreziy/RANSOMWARE-DETECTION-TOOL
+License: MIT
+
+Description:
+    Advanced behavioral-based ransomware detection using:
+    - Real-time filesystem monitoring
+    - Entropy analysis for encrypted content detection
+    - Honeypot deception files
+    - Process anomaly detection
+    - Statistical burst analysis
+"""
+
+import os
+import sys
+import time
+import json
+import logging
+import argparse
+import hashlib
+import shutil
+import threading
+import math
+from pathlib import Path
+from datetime import datetime, timedelta
+from collections import deque, defaultdict
+from typing import Dict, List, Set, Tuple, Optional
+
+# Try importing optional dependencies
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileModifiedEvent, FileMovedEvent # type: ignore
+    WATCHDOG_AVAILABLE = True
+except ImportError:
+    WATCHDOG_AVAILABLE = False
+    print("Warning: 'watchdog' not installed. Install with: pip install watchdog")
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("Warning: 'psutil' not installed (optional for process monitoring). Install with: pip install psutil")
+
+# ========== Configuration ==========
+DEFAULT_CONFIG = {
+    "entropy_threshold": 7.5,       # Shannon entropy threshold (typical encrypted > 7.5)
+    "burst_threshold": 50,          # Number of file events per minute to trigger alert
+    "burst_window_seconds": 60,     # Time window for burst detection
+    "suspicious_extensions": [".encrypted", ".enc", ".lock", ".crypt", ".wncry", ".ezz", ".locked", ".ransom"],
+    "ransomware_notes": ["HOW_TO_DECRYPT", "README_FOR_DECRYPT", "DECRYPT_INSTRUCTIONS", "RANSOM_NOTE", "RECOVER-FILES"],
+    "monitored_extensions": [".doc", ".docx", ".xls", ".xlsx", ".pdf", ".jpg", ".jpeg", ".png", ".txt", ".sql", ".csv"],
+    "excluded_dirs": ["/proc", "/sys", "/dev", "C:\\Windows", "C:\\Program Files", "/System", "/Library"],
+    "honeypot_names": ["secret_business_plan.docx", "password_backup.txt", "bank_accounts.xlsx", "important_database.sql"],
+    "max_file_size_mb": 100,        # Skip files larger than this for entropy scanning
+    "quarantine_dir": "./quarantine"
+}
+
+# ========== Entropy Calculation ==========
+def calculate_shannon_entropy(data: bytes, sample_limit: int = 1024 * 1024) -> float:
+    """
+    Calculate Shannon entropy of binary data.
+    High entropy (close to 8) indicates randomness typical of encrypted content.
+    """
+    if not data:
+        return 0.0
+    
+    # Sample first N bytes for large files for performance
+    if len(data) > sample_limit:
+        data = data[:sample_limit]
+    
+    byte_counts = defaultdict(int)
+    for byte in data:
+        byte_counts[byte] += 1
+    
+    entropy = 0.0
+    length = len(data)
+    for count in byte_counts.values():
+        probability = count / length
+        entropy -= probability * math.log2(probability)
+    
+    return entropy
+
+def file_entropy(filepath: str, max_size_mb: int = 100) -> Optional[float]:
+    """Calculate entropy of a file's contents."""
+    try:
+        file_size = os.path.getsize(filepath)
+        if file_size > max_size_mb * 1024 * 1024:
+            return None
+        
+        with open(filepath, 'rb') as f:
+            data = f.read()
+            return calculate_shannon_entropy(data)
+    except (IOError, OSError):
+        return None
+
+# ========== Suspicious Process Detection ==========
+class ProcessDetector:
+    """Detect known ransomware processes and anomalies."""
+    
+    # Known ransomware process names (case-insensitive)
+    SUSPICIOUS_PROCESSES = {
+        "wannacry", "locky", "cryptolocker", "badrabbit", "petya", "notpetya",
+        "ryuk", "phobos", "globelmposter", "cerber", "xvpn", "taskmgr.exe"  # some masquerade
+    }
+    
+    @staticmethod
+    def scan_running_processes() -> List[str]:
+        """Return list of suspicious running processes."""
+        if not PSUTIL_AVAILABLE:
+            return []
+        
+        suspicious = []
+        try:
+            for proc in psutil.process_iter(['name', 'pid']):
+                try:
+                    proc_name = proc.info['name'].lower()
+                    for susp in ProcessDetector.SUSPICIOUS_PROCESSES:
+                        if susp in proc_name:
+                            suspicious.append(f"{proc.info['name']} (PID: {proc.info['pid']})")
+                            break
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception as e:
+            logging.error(f"Process scan error: {e}")
+        
+        return suspicious
+
+# ========== Honeypot Manager ==========
+class HoneypotManager:
+    """Create and manage decoy files to detect ransomware tampering."""
+    
+    def __init__(self, protect_dir: str, config: dict):
+        self.protect_dir = Path(protect_dir)
+        self.config = config
+        self.honeypot_files: Set[Path] = set()
+        self.honeypot_content = "DECOY_FILE_RANSOMWARE_DETECTION_{orezziy}_SENSITIVE_DATA"
+    
+    def deploy_honeypots(self) -> List[Path]:
+        """Create honeypot files in protected directory."""
+        deployed = []
+        for name in self.config.get("honeypot_names", []):
+            hp_path = self.protect_dir / name
+            if not hp_path.exists():
+                try:
+                    with open(hp_path, 'w') as f:
+                        f.write(self.honeypot_content)
+                    deployed.append(hp_path)
+                    self.honeypot_files.add(hp_path)
+                    logging.info(f"Honeypot deployed: {hp_path}")
+                except Exception as e:
+                    logging.error(f"Failed to deploy honeypot {hp_path}: {e}")
+        return deployed
+    
+    def is_honeypot(self, filepath: str) -> bool:
+        """Check if file is a known honeypot."""
+        return Path(filepath) in self.honeypot_files
+    
+    def check_honeypot_integrity(self) -> List[str]:
+        """Check if any honeypot files were modified."""
+        altered = []
+        for hp in self.honeypot_files:
+            if hp.exists():
+                try:
+                    with open(hp, 'r') as f:
+                        content = f.read()
+                        if self.honeypot_content not in content:
+                            altered.append(str(hp))
+                except Exception:
+                    altered.append(str(hp))
+            else:
+                altered.append(str(hp))  # File missing = deleted
+        return altered
+
+# ========== File Scanner (On-Demand) ==========
+class RansomwareScanner:
+    """Scan directories for signs of ransomware encryption."""
+    
+    def __init__(self, config: dict):
+        self.config = config
+        self.alerts = []
+    
+    def scan_directory(self, directory: str, recursive: bool = True) -> List[Dict]:
+        """
+        Scan directory for suspicious files.
+        Returns list of alerts with details.
+        """
+        alerts = []
+        path = Path(directory)
+        
+        if not path.exists():
+            logging.error(f"Directory not found: {directory}")
+            return alerts
+        
+        # Scan for ransomware notes
+        for note_pattern in self.config["ransomware_notes"]:
+            for note_file in path.rglob(f"*{note_pattern}*"):
+                if note_file.is_file():
+                    alerts.append({
+                        "type": "ransomware_note",
+                        "file": str(note_file),
+                        "severity": "HIGH",
+                        "message": f"Ransomware note detected: {note_file.name}"
+                    })
+        
+        # Scan for suspicious extensions
+        suspicious_exts = self.config["suspicious_extensions"]
+        for ext in suspicious_exts:
+            for file_path in path.rglob(f"*{ext}"):
+                if file_path.is_file():
+                    alerts.append({
+                        "type": "suspicious_extension",
+                        "file": str(file_path),
+                        "severity": "HIGH",
+                        "message": f"File with ransomware extension: {file_path.name}"
+                    })
+        
+        # Entropy-based detection
+        for file_path in path.rglob("*"):
+            if not file_path.is_file():
+                continue
+            
+            # Skip excluded directories
+            if any(excl in str(file_path) for excl in self.config["excluded_dirs"]):
+                continue
+            
+            # Only check monitored file types
+            if file_path.suffix.lower() not in self.config["monitored_extensions"]:
+                continue
+            
+            entropy = file_entropy(str(file_path), self.config["max_file_size_mb"])
+            if entropy and entropy > self.config["entropy_threshold"]:
+                alerts.append({
+                    "type": "high_entropy",
+                    "file": str(file_path),
+                    "severity": "MEDIUM",
+                    "entropy": round(entropy, 2),
+                    "message": f"High entropy detected (potential encryption): {entropy:.2f}"
+                })
+        
+        return alerts
+
+# ========== Real-time Monitor (watchdog) ==========
+class RansomwareEventHandler(FileSystemEventHandler):
+    """Handle filesystem events and detect ransomware behavior."""
+    
+    def __init__(self, config: dict, detector_instance):
+        self.config = config
+        self.detector = detector_instance
+        self.event_queue = deque(maxlen=1000)
+        self.event_timestamps = deque(maxlen=500)
+        self.file_rename_map = {}
+        
+    def on_created(self, event):
+        if not event.is_directory:
+            self._handle_event(event.src_path, "created")
+    
+    def on_modified(self, event):
+        if not event.is_directory:
+            self._handle_event(event.src_path, "modified")
+    
+    def on_moved(self, event):
+        if not event.is_directory:
+            self._handle_event(event.dest_path, "moved", src_path=event.src_path)
+    
+    def _handle_event(self, filepath: str, event_type: str, src_path: str = None):
+        """Process single filesystem event."""
+        # Track event for burst detection
+        self.event_timestamps.append(time.time())
+        
+        # Check if it's a honeypot
+        if hasattr(self.detector, 'honeypot') and self.detector.honeypot.is_honeypot(filepath):
+            self.detector.raise_alert(
+                "HONEYPOT_ACCESS",
+                f"Honeypot file accessed/modified: {filepath}",
+                "CRITICAL"
+            )
+        
+        # Check for ransomware notes
+        filename = os.path.basename(filepath)
+        for note in self.config["ransomware_notes"]:
+            if note.lower() in filename.lower():
+                self.detector.raise_alert(
+                    "RANSOMWARE_NOTE",
+                    f"Ransomware note created: {filename} at {filepath}",
+                    "HIGH"
+                )
+        
+        # Check for suspicious extension changes
+        if event_type == "moved" and src_path:
+            old_ext = os.path.splitext(src_path)[1].lower()
+            new_ext = os.path.splitext(filepath)[1].lower()
+            if new_ext in self.config["suspicious_extensions"]:
+                self.detector.raise_alert(
+                    "EXTENSION_CHANGE",
+                    f"File renamed to suspicious extension: {src_path} -> {filepath}",
+                    "HIGH"
+                )
+        
+        # Check new file extension directly
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext in self.config["suspicious_extensions"]:
+            self.detector.raise_alert(
+                "SUSPICIOUS_EXTENSION",
+                f"Suspicious extension created: {filename} ({ext})",
+                "HIGH"
+            )
+    
+    def check_burst_activity(self):
+        """Detect mass file modifications (ransomware behavior)."""
+        current_time = time.time()
+        window_start = current_time - self.config["burst_window_seconds"]
+        
+        # Count events in time window
+        event_count = sum(1 for ts in self.event_timestamps if ts >= window_start)
+        
+        if event_count > self.config["burst_threshold"]:
+            self.detector.raise_alert(
+                "BURST_ACTIVITY",
+                f"Mass file changes detected: {event_count} changes in {self.config['burst_window_seconds']} seconds",
+                "CRITICAL"
+            )
+            self.event_timestamps.clear()  # Avoid repeated alerts
+
+# ========== Main Detector Class ==========
+class RansomwareDetector:
+    """Main ransomware detection orchestration."""
+    
+    def __init__(self, config: dict = None):
+        self.config = config or DEFAULT_CONFIG
+        self.alerts_log = []
+        self.observer = None
+        self.scanner = RansomwareScanner(self.config)
+        self.process_monitor_thread = None
+        self.burst_check_thread = None
+        self.running = False
+        self.honeypot = None
+        self.protect_dir = None
+        
+        # Setup logging
+        self._setup_logging()
+        
+        # Personal signature banner
+        self._print_banner()
+    
+    def _print_banner(self):
+        banner = f"""
+╔══════════════════════════════════════════════════════════════════╗
+║     Ransomware Detection Tool - Behavioral Analysis System       ║
+║                    Signature: {{OrezZIY o'T}}                    ║
+║                  Professional Security Tool v1.0                 ║
+╚══════════════════════════════════════════════════════════════════╝
+        """
+        print(banner)
+        logging.info("Ransomware Detection Tool initialized - {{orezziy}}")
+    
+    def _setup_logging(self):
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('ransomware_detector.log'),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+    
+    def raise_alert(self, alert_type: str, message: str, severity: str = "MEDIUM"):
+        """Log and store security alerts."""
+        alert = {
+            "timestamp": datetime.now().isoformat(),
+            "type": alert_type,
+            "severity": severity,
+            "message": message
+        }
+        self.alerts_log.append(alert)
+        
+        log_func = logging.critical if severity == "CRITICAL" else logging.warning if severity == "HIGH" else logging.warning
+        log_func(f"[{alert_type}] {message}")
+        
+        # Write to alert log file
+        with open("alerts.json", "a") as f:
+            f.write(json.dumps(alert) + "\n")
+        
+        # Optional: trigger quarantine
+        if severity in ["HIGH", "CRITICAL"]:
+            self._auto_quarantine(message)
+    
+    def _auto_quarantine(self, alert_message: str):
+        """Basic quarantine suggestion/log."""
+        logging.info(f"Auto-quarantine triggered by: {alert_message}")
+        # In production, you'd implement actual file quarantine here
+    
+    def start_monitoring(self, directory: str):
+        """Start real-time filesystem monitoring."""
+        if not WATCHDOG_AVAILABLE:
+            logging.error("Cannot start monitoring: 'watchdog' library not installed.")
+            return False
+        
+        self.protect_dir = Path(directory)
+        if not self.protect_dir.exists():
+            logging.error(f"Directory does not exist: {directory}")
+            return False
+        
+        # Deploy honeypots
+        self.honeypot = HoneypotManager(directory, self.config)
+        deployed = self.honeypot.deploy_honeypots()
+        logging.info(f"Deployed {len(deployed)} honeypot files")
+        
+        # Setup event handler
+        event_handler = RansomwareEventHandler(self.config, self)
+        self.observer = Observer()
+        self.observer.schedule(event_handler, str(directory), recursive=True)
+        self.observer.start()
+        self.running = True
+        
+        # Start burst monitoring thread
+        self.burst_check_thread = threading.Thread(target=self._burst_monitor_loop, args=(event_handler,), daemon=True)
+        self.burst_check_thread.start()
+        
+        # Start process monitoring thread (optional)
+        if PSUTIL_AVAILABLE:
+            self.process_monitor_thread = threading.Thread(target=self._process_monitor_loop, daemon=True)
+            self.process_monitor_thread.start()
+        
+        logging.info(f"Real-time monitoring started on: {directory}")
+        print(f"✓ Monitoring active on {directory}")
+        print("Press Ctrl+C to stop...")
+        
+        try:
+            while self.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.stop_monitoring()
+        
+        return True
+    
+    def _burst_monitor_loop(self, event_handler: RansomwareEventHandler):
+        """Periodically check for burst activity."""
+        while self.running:
+            time.sleep(5)
+            try:
+                event_handler.check_burst_activity()
+            except Exception as e:
+                logging.error(f"Burst monitor error: {e}")
+    
+    def _process_monitor_loop(self):
+        """Monitor running processes for ransomware indicators."""
+        while self.running:
+            suspicious = ProcessDetector.scan_running_processes()
+            if suspicious:
+                self.raise_alert(
+                    "SUSPICIOUS_PROCESS",
+                    f"Suspicious processes detected: {', '.join(suspicious)}",
+                    "HIGH"
+                )
+            time.sleep(30)  # Scan every 30 seconds
+    
+    def stop_monitoring(self):
+        """Stop all monitoring activities."""
+        self.running = False
+        if self.observer:
+            self.observer.stop()
+            self.observer.join()
+        logging.info("Monitoring stopped.")
+        print("\nMonitoring stopped.")
+    
+    def run_scan(self, directory: str, recursive: bool = True) -> List[Dict]:
+        """Perform on-demand security scan."""
+        print(f"\n[*] Scanning {directory} for ransomware indicators...")
+        alerts = self.scanner.scan_directory(directory, recursive)
+        
+        if alerts:
+            print(f"\n[!] Found {len(alerts)} potential threats:")
+            for alert in alerts:
+                print(f"  - [{alert['severity']}] {alert['message']} (File: {alert['file']})")
+                self.raise_alert(alert['type'], alert['message'], alert['severity'])
+        else:
+            print("[✓] No ransomware indicators found.")
+        
+        return alerts
+    
+    def generate_report(self) -> str:
+        """Generate JSON report of all alerts."""
+        report = {
+            "generated": datetime.now().isoformat(),
+            "tool_signature": "{orezziy}",
+            "total_alerts": len(self.alerts_log),
+            "alerts": self.alerts_log,
+            "config": self.config
+        }
+        
+        with open("detection_report.json", "w") as f:
+            json.dump(report, f, indent=2)
+        
+        return "detection_report.json"
+
+# ========== CLI Interface ==========
+def main():
+    parser = argparse.ArgumentParser(
+        description="Ransomware Detection Tool - Professional Behavioral Analysis",
+        epilog="Signature: {orezziy} - GitHub: https://github.com/orezziy/ransomware-detector"
+    )
+    
+    parser.add_argument("--monitor", "-m", type=str, help="Directory to monitor in real-time")
+    parser.add_argument("--scan", "-s", type=str, help="Directory to scan on-demand")
+    parser.add_argument("--generate-honeypots", "-g", type=str, help="Generate honeypot files in specified directory")
+    parser.add_argument("--config", "-c", type=str, help="JSON configuration file")
+    parser.add_argument("--report", "-r", action="store_true", help="Generate report after scan/monitor")
+    parser.add_argument("--threshold", "-t", type=float, default=7.5, help="Entropy threshold (default: 7.5)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    
+    args = parser.parse_args()
+    
+    # Load custom config if provided
+    config = DEFAULT_CONFIG.copy()
+    if args.config:
+        try:
+            with open(args.config, 'r') as f:
+                user_config = json.load(f)
+                config.update(user_config)
+        except Exception as e:
+            print(f"Error loading config: {e}")
+    
+    if args.threshold:
+        config["entropy_threshold"] = args.threshold
+    
+    # Initialize detector
+    detector = RansomwareDetector(config)
+    
+    # Handle generate honeypots only
+    if args.generate_honeypots:
+        honeypot = HoneypotManager(args.generate_honeypots, config)
+        deployed = honeypot.deploy_honeypots()
+        print(f"Deployed {len(deployed)} honeypot files in {args.generate_honeypots}")
+        return 0
+    
+    # Handle monitoring mode
+    if args.monitor:
+        detector.start_monitoring(args.monitor)
+        if args.report:
+            report_file = detector.generate_report()
+            print(f"\nReport generated: {report_file}")
+        return 0
+    
+    # Handle scan mode
+    if args.scan:
+        alerts = detector.run_scan(args.scan)
+        if args.report:
+            report_file = detector.generate_report()
+            print(f"\nReport generated: {report_file}")
+        return 0
+    
+    # No arguments - show help
+    parser.print_help()
+    print("\nExample usage:")
+    print("  python ransomware_detector.py --scan /home/user/documents")
+    print("  python ransomware_detector.py --monitor /home/user/documents")
+    print("  python ransomware_detector.py --generate-honeypots /home/user/documents")
+    return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
